@@ -1,0 +1,16 @@
+# 凭据 / 会话 —— 绝不提交
+.test/
+session.json
+*.session.json
+.workbuddy-codex/
+
+# 运行时产物
+*.log
+npm-debug.log*
+node_modules/
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

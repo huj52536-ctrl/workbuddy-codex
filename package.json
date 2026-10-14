@@ -1,0 +1,55 @@
+{
+  "name": "workbuddy-codex",
+  "version": "1.0.0",
+  "description": "把 WorkBuddy / CodeBuddy 的模型接入任意 OpenAI Codex CLI —— 本地 Responses ⇄ Chat Completions 协议桥",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.17"
+  },
+  "bin": {
+    "workbuddy-codex": "./bin/workbuddy-codex.mjs"
+  },
+  "exports": {
+    "./translate": "./src/translate.mjs",
+    "./credentials": "./src/credentials.mjs",
+    "./codex-config": "./src/codex-config.mjs",
+    "./server": "./src/server.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "tools",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node ./bin/workbuddy-codex.mjs start",
+    "install-bridge": "node ./bin/workbuddy-codex.mjs install",
+    "doctor": "node ./bin/workbuddy-codex.mjs doctor",
+    "test": "node --test \"test/*.test.mjs\"",
+    "test:roundtrip": "node tools/verify-roundtrip.mjs",
+    "prove:catalog": "node tools/prove-catalog-fix.mjs"
+  },
+  "keywords": [
+    "codex",
+    "openai-codex",
+    "workbuddy",
+    "codebuddy",
+    "codebuddy2api",
+    "responses-api",
+    "chat-completions",
+    "proxy",
+    "bridge",
+    "llm-gateway"
+  ],
+  "dependencies": {},
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/huj52536-ctrl/workbuddy-codex.git"
+  },
+  "bugs": {
+    "url": "https://github.com/huj52536-ctrl/workbuddy-codex/issues"
+  },
+  "homepage": "https://github.com/huj52536-ctrl/workbuddy-codex#readme"
+}

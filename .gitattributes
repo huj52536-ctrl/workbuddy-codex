@@ -1,0 +1,19 @@
+# 统一行尾为 LF：本项目跨平台（Windows / macOS / Linux），
+# 且 .mjs 脚本在 macOS/Linux 上会因 CRLF 出现 shebang 问题。
+* text=auto eol=lf
+
+# 明确二进制，避免被当作文本处理
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
+
+# Windows 批处理保持 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.vbs text eol=crlf
+
+# shell 脚本必须 LF
+*.sh text eol=lf
