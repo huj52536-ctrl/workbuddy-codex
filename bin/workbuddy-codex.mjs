@@ -25,6 +25,9 @@ import {
   loadState, saveState,
 } from "../src/credentials.mjs";
 import {
+  REGIONS, DEFAULT_REGION, endpointsFor, resolveEndpoints, normalizeRegionId, probeHosts,
+} from "../src/region.mjs";
+import {
   startDetached, stopDaemon, daemonStatus, waitForPid, waitForHealth,
   writeOwnPid, clearPid, readPid, LOG_FILE, PID_FILE,
 } from "../src/daemon.mjs";
@@ -211,9 +214,61 @@ function pickDefaultModel(models, explicit) {
   return (stable[0] ?? models[0])?.id ?? "auto";
 }
 
-async function ensureModels(cred) {
+/**
+ * 解析本次运行要用的端点。
+ *
+ * 优先级：--region > 环境变量 WORKBUDDY_CODEX_REGION > 凭据 domain 推断 > 默认(CN)
+ *
+ * 只在**显式指定**区域时才做多主机探测（逐个试到能推理为止）；
+ * 未指定时保持与改造前一致的行为——直接用中国区端点，
+ * 避免给现有用户增加额外网络往返。
+ */
+async function resolveEffectiveEndpoints(cred) {
+  const explicit = flag("region");
+  const explicitRegion = typeof explicit === "string" ? explicit : process.env.WORKBUDDY_CODEX_REGION;
+
+  const domain = cred?.session?.account?.domain;
+  const r = resolveEndpoints({ explicitRegion, domain });
+
+  // 显式指定区域（且非 auto）时，逐个 host 探测，确保选到真正能用的那个
+  const wantsProbe = typeof explicitRegion === "string" && normalizeRegionId(explicitRegion) !== "auto";
+  if (wantsProbe && r.endpoints.hosts.length > 1 && cred.kind !== "none") {
+    say(C.dim(`  正在探测 ${r.endpoints.label} 的可用主机…`));
+    const probeCred = {
+      ...cred,
+      session: cred.session
+        ? { ...cred.session, account: { ...cred.session.account, domain: r.endpoints.defaultDomain } }
+        : undefined,
+    };
+    const { endpoints, attempts } = await probeHosts({
+      hosts: r.endpoints.hosts,
+      region: r.region,
+      probe: (ep) => verifyInference(probeCred, { endpoints: ep, timeoutMs: 30000 }),
+    });
+    for (const a of attempts) {
+      say(C.dim(`    ${a.ok ? C.ok("✓") : "✗"} ${a.host}${a.ok ? "" : ` — ${String(a.reason ?? "").slice(0, 70)}`}`));
+    }
+    if (endpoints) {
+      return { endpoints, region: r.region, source: "probe", reason: `探测选定 ${endpoints.backend}` };
+    }
+    say(C.warn(`  ${r.endpoints.label} 的所有候选主机都无法推理`));
+    return { endpoints: r.endpoints, region: r.region, source: r.source, reason: r.reason };
+  }
+
+  return { endpoints: r.endpoints, region: r.region, source: r.source, reason: r.reason };
+}
+
+/** 打印一行区域信息，便于用户确认工具到底连的是哪个区域。 */
+function sayRegion(region, source) {
+  const r = REGIONS[region];
+  const label = r ? r.label : region;
+  const auto = (source === "explicit" || source === "probe") ? "" : "（自动推断）";
+  say(`  区域    : ${label}${auto}`);
+}
+
+async function ensureModels(cred, endpoints) {
   try {
-    return await fetchModels(cred);
+    return await fetchModels(cred, { endpoints });
   } catch (e) {
     say(C.warn(`获取模型目录失败（将使用退避列表）：${e.message}`));
     return [
@@ -224,7 +279,7 @@ async function ensureModels(cred) {
   }
 }
 
-async function startServer({ quiet = false, daemonChild = false } = {}) {
+async function startServer({ quiet = false, daemonChild = false, endpoints } = {}) {
   const state = {
     log,
     apiKeyOverride: typeof flag("api-key") === "string" ? flag("api-key") : undefined,
@@ -233,6 +288,8 @@ async function startServer({ quiet = false, daemonChild = false } = {}) {
     reasoningSummary: !has("no-reasoning-summary"),
     cachedModels: null,
     fallbackModels: [],
+    // 端点由 CLI 解析后注入；缺省为中国区，行为与改造前一致
+    endpoints: endpoints ?? endpointsFor(DEFAULT_REGION),
   };
   if (typeof flag("api-key") === "string") {
     process.env.WORKBUDDY_API_KEY = flag("api-key");
@@ -328,7 +385,10 @@ async function cmdLogin() {
 async function cmdModels() {
   const cred = resolveCredential({ explicitKey: typeof flag("api-key") === "string" ? flag("api-key") : undefined });
   if (cred.kind === "none") { say(C.bad("未找到凭据。请先 `workbuddy-codex login` 或设置 WORKBUDDY_API_KEY。")); process.exitCode = 1; return; }
-  const models = await ensureModels(cred);
+  const regionInfo = await resolveEffectiveEndpoints(cred);
+  sayRegion(regionInfo.region, regionInfo.source);
+  say(C.dim(`  端点    : ${regionInfo.endpoints.backend}\n`));
+  const models = await ensureModels(cred, regionInfo.endpoints);
   say(C.bold(`可用模型（${models.length}）`));
   const pad = (s, n) => String(s).padEnd(n);
   say(C.dim(`${pad("模型 ID", 24)}${pad("名称", 22)}${pad("上下文", 12)}${pad("最大输出", 12)}图片  推理`));
@@ -379,13 +439,18 @@ async function cmdDoctor() {
 
   say(C.bold("\n3) 上游连通性"));
   if (cred.kind !== "none") {
+    // 区域：显式指定时逐个主机探测；否则按凭据 domain 推断（或默认中国区）
+    const regionInfo = await resolveEffectiveEndpoints(cred);
+    const ep = regionInfo.endpoints;
+    sayRegion(regionInfo.region, regionInfo.source);
+    say(C.dim(`  端点    : ${ep.backend}`));
     // 注意：`/v3/config` 的鉴权比推理端点**宽松**。
     // 只看它会给用户"一切正常"的错觉，而实际推理可能 401。
     // 因此这里必须做一次真实的推理验证。
     let catalogOk = false;
     let modelCount = 0;
     try {
-      const models = await fetchModels(cred);
+      const models = await fetchModels(cred, { endpoints: ep });
       catalogOk = true;
       modelCount = models.length;
     } catch (e) {
@@ -393,10 +458,9 @@ async function cmdDoctor() {
     }
     if (catalogOk) say(C.dim(`  模型目录：可用（${modelCount} 个模型）`));
 
-    const probe = await verifyInference(cred);
+    const probe = await verifyInference(cred, { endpoints: ep });
     if (probe.ok) {
       say(`  ${C.ok("✓")} 凭据可用于推理`);
-      say(C.dim(`    上游: ${CHAT_URL}`));
     } else {
       say(`  ${C.bad("✗")} ${probe.reason}`);
       if (probe.hint) say(C.warn(`    ${probe.hint}`));
@@ -407,13 +471,18 @@ async function cmdDoctor() {
       if (cred.kind === "token" && cred.session) {
         say(C.dim("    尝试刷新令牌…"));
         try {
-          await refreshSession(cred.session, { persist: !cred.fromDesktop && !cred.fromDsh });
-          const re = await verifyInference(resolveCredential());
+          await refreshSession(cred.session, { persist: !cred.fromDesktop && !cred.fromDsh, endpoints: ep });
+          const re = await verifyInference(resolveCredential(), { endpoints: ep });
           if (re.ok) say(`  ${C.ok("✓")} 刷新后可用`);
           else say(`  ${C.bad("✗")} 刷新后仍失败：${re.reason}`);
         } catch (e2) {
           say(`  ${C.bad("✗")} 刷新失败：${e2.message}`);
         }
+      }
+      // 区域选错是最常见的失败原因之一，主动给出建议
+      if (!has("region") && !process.env.WORKBUDDY_CODEX_REGION) {
+        const other = regionInfo.region === "cn" ? "intl" : "cn";
+        say(C.dim(`    若你的账号属于${REGIONS[other].label}，可试试：workbuddy-codex doctor --region ${other}`));
       }
     }
   } else {
@@ -493,16 +562,32 @@ async function cmdInstall() {
 
   let cred = null;
   let probe = null;
+  let endpoints = null;
+  let regionInfo = null;
+
   for (const cand of candidates) {
     const label = cand.kind === "api-key" ? "API Key" : "登录令牌";
     say(C.dim(`  验证凭据来源：${label} (${cand.source})`));
-    let r = await verifyInference(cand);
+
+    // 端点按「显式 --region > 该候选的 domain 推断 > 默认」确定。
+    // 放在循环内是因为不同候选可能属于不同区域（例如桌面端国际版凭据）。
+    if (!endpoints) {
+      regionInfo = await resolveEffectiveEndpoints(cand);
+      endpoints = regionInfo.endpoints;
+      sayRegion(regionInfo.region, regionInfo.source);
+      say(C.dim(`  端点    : ${endpoints.backend}`));
+    }
+
+    let r = await verifyInference(cand, { endpoints });
 
     // 令牌失败时尝试刷新一次
     if (!r.ok && cand.kind === "token" && cand.session) {
       try {
-        const refreshed = await refreshSession(cand.session, { persist: !cand.fromDesktop && !cand.fromDsh });
-        r = await verifyInference({ ...cand, session: refreshed, value: refreshed.auth.accessToken });
+        const refreshed = await refreshSession(cand.session, {
+          persist: !cand.fromDesktop && !cand.fromDsh,
+          endpoints,
+        });
+        r = await verifyInference({ ...cand, session: refreshed, value: refreshed.auth.accessToken }, { endpoints });
         if (r.ok) { cand.session = refreshed; cand.value = refreshed.auth.accessToken; }
       } catch { /* 刷新失败则继续下一个候选 */ }
     }
@@ -516,6 +601,11 @@ async function cmdInstall() {
     say(`\n${C.bad("✗")} 所有候选凭据都无法用于推理。`);
     if (probe?.hint) say(C.warn(`  ${probe.hint}`));
     say(C.dim(`  候选来源数：${candidates.length}`));
+    if (endpoints) say(C.dim(`  已尝试端点：${endpoints.backend}`));
+    if (!has("region") && !process.env.WORKBUDDY_CODEX_REGION && regionInfo) {
+      const other = regionInfo.region === "cn" ? "intl" : "cn";
+      say(C.warn(`  若你的账号属于${REGIONS[other].label}，试试：workbuddy-codex install --region ${other}`));
+    }
     say(C.warn("\n  配置未写入，Codex 保持原状。"));
     process.exitCode = 1;
     return;
@@ -525,18 +615,20 @@ async function cmdInstall() {
   say(`${C.ok("✓")} 凭据可用于推理`);
 
   // 2) 模型 + 目录
-  const models = await ensureModels(cred);
+  const models = await ensureModels(cred, endpoints);
   const chosen = pickDefaultModel(models, flag("model"));
 
   // 3) 选端口并以**分离进程**启动服务 —— 不霸占当前终端。
   const { port: actualPort } = await pickPort(PORT);
-  saveState({ port: actualPort });
+  saveState({ port: actualPort, region: regionInfo?.region ?? DEFAULT_REGION });
   say(`${C.dim("  正在启动后台桥接服务…")}`);
 
   const root = fileURLToPath(new URL("..", import.meta.url));
   const daemonArgs = ["start", "--daemon"];
   if (typeof flag("api-key") === "string") daemonArgs.push("--api-key", flag("api-key"));
   if (typeof flag("bridge-key") === "string") daemonArgs.push("--bridge-key", flag("bridge-key"));
+  // 把已解析的区域传给守护进程，避免它在后台重新推断出不同结果
+  if (regionInfo) daemonArgs.push("--region", regionInfo.region);
 
   startDetached({ root, nodePath: process.execPath, args: daemonArgs, port: actualPort });
   const health = await waitForHealth(actualPort, 25000);
@@ -754,6 +846,14 @@ async function cmdServiceStart(port) {
   const daemonArgs = ["start", "--daemon"];
   if (typeof flag("api-key") === "string") daemonArgs.push("--api-key", flag("api-key"));
   if (typeof flag("bridge-key") === "string") daemonArgs.push("--bridge-key", flag("bridge-key"));
+  // 区域：显式给出时透传；否则守护进程会按凭据 domain 自行推断
+  const region = flag("region");
+  if (typeof region === "string") daemonArgs.push("--region", region);
+  else if (process.env.WORKBUDDY_CODEX_REGION) daemonArgs.push("--region", process.env.WORKBUDDY_CODEX_REGION);
+  else {
+    const st = loadState();
+    if (st?.region) daemonArgs.push("--region", st.region);
+  }
 
   startDetached({ root, nodePath: process.execPath, args: daemonArgs, port });
   const health = await waitForHealth(port, 20000);
@@ -784,10 +884,19 @@ ${C.bold("命令")}
   status      显示当前状态
 
 ${C.bold("选项")}
+  --region <cn|intl|auto>
+                   区域：cn=中国区（默认），intl=国际版，auto=按凭据自动推断。
+                   省略时按凭据里的 domain 自动判断，判断不出则用 cn。
   --port <n>       桥接端口（默认 8799；被占用时自动向后顺延）
   --model <id>     指定默认模型
   --api-key <key>  直接用 API Key（也可用环境变量 WORKBUDDY_API_KEY）
   --verbose        输出调试日志
+
+${C.bold("区域")}
+  cn    中国区        copilot.tencent.com / workbuddy.cn
+  intl  国际版        codebuddy.ai / workbuddy.ai
+  指定区域时会逐个探测候选主机，取第一个**真正能推理**的。
+  国际版尚未实机验证（见 README「已知限制」）。
 
 ${C.bold("说明")}
   Codex 0.95.0+ 只支持 Responses API。本工具在本地做 Responses ⇄ Chat Completions
@@ -807,13 +916,18 @@ switch (command) {
   case "service": await cmdService(); break;
   case "status": await cmdStatus(); break;
   case "start": {
-    // --daemon：作为分离进程启动（内部使用，由 spawnDetached 调用）
+    // --daemon：作为分离进程启动（内部使用，由 startDetached 调用）
     if (has("daemon")) {
       const cred = resolveCredential();
       if (cred.kind === "none") { process.exitCode = 1; break; }
-      const { state, port: p } = await startServer({ quiet: true, daemonChild: true });
-      try { state.cachedModels = await fetchModels(cred); } catch { /* ignore */ }
-      log(`daemon 已就绪 port=${p} pid=${process.pid}`);
+      // 区域由 CLI 通过 --region 传入（install 已解析好），这里不再重新推断，
+      // 避免前台与后台得出不同结论
+      const regionInfo = await resolveEffectiveEndpoints(cred);
+      const { state, port: p } = await startServer({
+        quiet: true, daemonChild: true, endpoints: regionInfo.endpoints,
+      });
+      try { state.cachedModels = await fetchModels(cred, { endpoints: regionInfo.endpoints }); } catch { /* ignore */ }
+      log(`daemon 已就绪 port=${p} region=${regionInfo.region} pid=${process.pid}`);
       break;
     }
 
@@ -830,8 +944,13 @@ switch (command) {
       break;
     }
     printCredInfo(cred);
-    const { state, port: p } = await startServer();
-    try { state.cachedModels = await fetchModels(cred); say(C.dim(`  已加载 ${state.cachedModels.length} 个模型`)); } catch { /* ignore */ }
+    const regionInfo = await resolveEffectiveEndpoints(cred);
+    sayRegion(regionInfo.region, regionInfo.source);
+    const { state, port: p } = await startServer({ endpoints: regionInfo.endpoints });
+    try {
+      state.cachedModels = await fetchModels(cred, { endpoints: regionInfo.endpoints });
+      say(C.dim(`  已加载 ${state.cachedModels.length} 个模型`));
+    } catch { /* ignore */ }
     say(C.dim("\n按 Ctrl+C 停止。"));
     process.on("SIGINT", () => { say("\n已停止。"); process.exit(0); });
     break;

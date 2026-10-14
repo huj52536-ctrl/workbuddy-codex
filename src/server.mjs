@@ -18,13 +18,24 @@ import {
   toSse,
 } from "./translate.mjs";
 import {
-  CHAT_URL,
   buildUpstreamHeaders,
   resolveCredential,
   refreshSession,
   sessionNeedsRefresh,
   fetchModels,
+  endpointsFor,
+  DEFAULT_REGION,
 } from "./credentials.mjs";
+
+/**
+ * 取本次运行使用的端点。
+ *
+ * `state.endpoints` 由 CLI 依据 --region / 凭据 domain / 探测结果写入；
+ * 缺失时回落到中国区默认端点 —— 保证既有调用方与老用户行为不变。
+ */
+function endpointsOf(state) {
+  return state?.endpoints ?? endpointsFor(DEFAULT_REGION);
+}
 
 /** 解析上游 SSE 的字节流为 data 载荷字符串。 */
 async function* sseDataLines(webStream) {
@@ -74,11 +85,12 @@ async function readBody(req, limitBytes = 32 * 1024 * 1024) {
  * 令牌临近过期时自动刷新一次。
  */
 async function callUpstream(chatBody, state, { retryOn401 = true } = {}) {
+  const ep = endpointsOf(state);
   let credential = resolveCredential({ explicitKey: state.apiKeyOverride });
 
   if (credential.kind === "token" && credential.session && sessionNeedsRefresh(credential.session)) {
     try {
-      const refreshed = await refreshSession(credential.session);
+      const refreshed = await refreshSession(credential.session, { endpoints: ep });
       credential = { ...credential, session: refreshed, value: refreshed.auth.accessToken };
       state.log?.("token 已刷新");
     } catch (e) {
@@ -93,7 +105,7 @@ async function callUpstream(chatBody, state, { retryOn401 = true } = {}) {
   }
 
   const headers = buildUpstreamHeaders(credential);
-  const res = await fetch(CHAT_URL, {
+  const res = await fetch(ep.chatUrl, {
     method: "POST",
     headers,
     body: JSON.stringify(chatBody),
@@ -104,9 +116,9 @@ async function callUpstream(chatBody, state, { retryOn401 = true } = {}) {
   if (res.status === 401 && retryOn401 && credential.kind === "token" && credential.session) {
     state.log?.("上游 401，尝试刷新令牌后重试");
     try {
-      const refreshed = await refreshSession(credential.session);
+      const refreshed = await refreshSession(credential.session, { endpoints: ep });
       const h2 = buildUpstreamHeaders({ ...credential, session: refreshed, value: refreshed.auth.accessToken });
-      return fetch(CHAT_URL, {
+      return fetch(ep.chatUrl, {
         method: "POST",
         headers: h2,
         body: JSON.stringify(chatBody),
@@ -157,11 +169,13 @@ export function createBridgeServer(state) {
       // 健康检查不需要鉴权（便于 doctor/status 探测）
       if (req.method === "GET" && (path === "/healthz" || path === "/health")) {
         const cred = resolveCredential({ explicitKey: state.apiKeyOverride });
+        const ep = endpointsOf(state);
         return json(res, 200, {
           status: "ok",
           credential: cred.kind,
           source: cred.source,
-          upstream: CHAT_URL,
+          upstream: ep.chatUrl,
+          region: ep.region,
           authRequired: Boolean(requireKey),
         });
       }
@@ -174,7 +188,7 @@ export function createBridgeServer(state) {
         let models = state.cachedModels ?? [];
         if (!models.length) {
           try {
-            models = await fetchModels(cred);
+            models = await fetchModels(cred, { endpoints: endpointsOf(state) });
             state.cachedModels = models;
           } catch (e) {
             log(`模型目录获取失败：${e.message}`);

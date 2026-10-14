@@ -14,3 +14,4 @@ node_modules/
 Thumbs.db
 .idea/
 .vscode/
+.commit-msg.txt

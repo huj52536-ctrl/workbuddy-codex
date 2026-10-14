@@ -52,7 +52,7 @@ node bin\workbuddy-codex.mjs install
 
 - README 里以 `#` 或 `::` 开头的行是**注释**，不要粘进 cmd ——
   会报 `'#' 不是内部或外部命令`。
-- `huj52536-ctrl` 这类尖括号内容是**占位符**，要替换成真实值；
+- `D:\path\to\...` 这类路径要替换成你自己的实际位置；
   照抄会报"系统找不到指定的文件"。
 - 跨盘符切目录必须用 `cd /d`，否则报"系统找不到指定的路径"。
 
@@ -117,9 +117,70 @@ node bin/workbuddy-codex.mjs uninstall
 | `models` | 列出当前凭据可用的模型 |
 | `status` | 显示当前状态 |
 
-选项：`--port <n>`（默认 8799；被占用时自动顺延到下一个空闲端口）、`--model <id>`、`--api-key <key>`、`--verbose`。
+选项：`--region <cn|intl|auto>`、`--port <n>`（默认 8799；被占用时自动顺延）、`--model <id>`、`--api-key <key>`、`--verbose`。
 
 **建议先跑 `doctor`**，它会检查一个很容易踩的坑（见下）。
+
+---
+
+## 区域：中国区 / 国际版
+
+WorkBuddy 与 CodeBuddy 是同一套代码的两个区域部署。本工具**默认按你凭据里的
+domain 自动判断**，判断不出就用中国区——所以大多数人什么都不用加。
+
+```bash
+workbuddy-codex doctor                 # 自动推断
+workbuddy-codex doctor --region intl   # 显式指定国际版
+workbuddy-codex doctor --region auto   # 强制走自动推断
+```
+
+| 区域 | 值 | 主机（按顺序探测） |
+|---|---|---|
+| 中国区 | `cn`（默认） | `copilot.tencent.com` → `www.workbuddy.cn` → `wb.tencentbuddy.com` |
+| 国际版 | `intl` | `www.codebuddy.ai` → `www.workbuddy.ai` |
+
+指定区域时会**逐个探测**候选主机，取第一个**真正能推理**的（不是第一个能连上的）。
+
+### 为什么协议层不用改
+
+从本机客户端包里读到的证据：
+
+1. **同一份客户端要对多个主机工作** —— `product.json` 的 `officialEndpoints`
+   同时列出 `workbuddy.cn` / `copilot.tencent.com` / `codebuddy.ai` 等；
+2. **区域判定只比对主机名** —— CLI 的 `isInternationalEndpoint()` 检查
+   `["codebuddy.ai", "workbuddy.ai", "staging-codebuddy.tencent.com"]`；
+3. **路径与区域无关** —— `/v3/config` 是版本探测数组
+   `["/v1/config","/v2/config","/v3/config", …]`；聊天地址只是给 base 补
+   `/chat/completions`（`normalizeChatCompletionsUrl` 的语义）。
+
+因此差异只在主机名，`Responses ⇄ Chat Completions` 转换层完全复用。
+
+### 国际版的实测进展与限制
+
+> **尚未用国际版账号完成端到端验证。** 以下是目前观察到的事实，请按需自测。
+
+用**国内版**令牌访问国际版端点，`doctor --region intl` 的结果是：
+
+```
+✗ https://www.codebuddy.ai — 推理端点鉴权失败（HTTP 401）
+✗ https://www.workbuddy.ai — 推理端点鉴权失败（HTTP 401）
+模型目录：可用（19 个模型）      ← /v3/config 响应正常
+```
+
+这说明：
+
+- ✅ 国际版**端点可达**，`/v3/config` 路径与鉴权方式**与国内版一致**
+  （否则不会返回 19 个模型）；
+- ✅ 401 的成因是**凭据属于另一个区域**，而不是协议不兼容；
+- ❓ **仍未经证实**：国际版是否同样强制流式、`tool_choice` 是否同样只接受字符串、
+  `X-Product: SaaS` 是否需要换值、桌面端凭据文件名是否有 `-ai` 变体。
+
+如果你有国际版账号，欢迎跑一次并把结果反馈：
+
+```bash
+workbuddy-codex doctor --region intl
+workbuddy-codex models --region intl
+```
 
 ---
 
@@ -253,8 +314,10 @@ node bin/workbuddy-codex.mjs uninstall
 3. **`namespace` 工具被拍平**为 `namespace__tool` 形式。
 4. 桥接进程需**保持运行**（`install` 已配置后台运行 + 开机自启）。
 5. 上游是非公开承诺的接口，路径与 Header 可能随客户端更新而变化。
-6. **仅在 Windows + Codex 0.162 上做过完整实测**。macOS / Linux 的代码路径
-   已按跨平台方式编写（`spawn detached`、`ps`/`lsof`），但**未经实机验证**。
+6. **中国区**已在 Windows + Codex 0.162 上完整实测（含工具调用与多轮 agent 回路）。
+   **国际版**仅验证到端点可达与目录接口兼容，**未经账号级端到端验证**。
+   macOS / Linux 的代码路径已按跨平台方式编写（`spawn detached`、`ps`/`lsof`），
+   但同样**未经实机验证**。
 
 ---
 
@@ -286,10 +349,15 @@ Codex 的 `model_catalog_json` schema **版本相关且严格**，字段缺失�
 ## 开发与发布
 
 ```bash
-npm test                    # 62 项单元 + 集成测试
+npm test                    # 83 项单元 + 集成测试
 npm run test:roundtrip      # 安装→卸载 往返还原验证
+npm run test:install        # 完整安装验证（隔离 HOME，含真实 Codex 端到端）
 npm run prove:catalog       # 模型目录模板的对照验证（需本机有 codex）
 ```
+
+`npm run test:install` 会在临时目录里搭一个**完全隔离的 HOME** 跑完整用户旅程
+（安装 → 生成物校验 → 真实 Codex 调用 → 服务重启 → 重复安装幂等 → 卸载还原 →
+区域选错时拒绝写配置），最后校验真实的 `~/.codex/config.toml` **一字未变**（34 项检查）。
 
 发布前建议按顺序自查：
 
@@ -300,10 +368,13 @@ npm test
 # 2) 安装/卸载能精确还原用户配置
 npm run test:roundtrip
 
-# 3) 仓库里没有凭据或本机路径
+# 3) 端到端（含真实 Codex 调用）
+npm run test:install
+
+# 4) 仓库里没有凭据或本机路径
 git grep -nE "[A-Z]:\\\\|sk-[A-Za-z0-9]{10}|accessToken.*[:=].*[A-Za-z0-9]{40}"
 
-# 4) 全新机器路径（无 ~/.codex/models.json）也能生成合法 catalog
+# 5) 全新机器路径（无 ~/.codex/models.json）也能生成合法 catalog
 npm run prove:catalog
 ```
 
@@ -398,11 +469,12 @@ node bin\workbuddy-codex.mjs service stop       :: 停止
 ```
 bin/workbuddy-codex.mjs   CLI 入口（命令分发、安装器、doctor）
 src/translate.mjs         Responses ⇄ Chat Completions 协议转换（纯函数，可单测）
+src/region.mjs            区域定义、端点解析、主机探测（纯函数，可单测）
 src/credentials.mjs       凭据发现/校验/刷新/登录 + 模型目录
 src/daemon.mjs            分离进程的启停、PID 管理、健康探测
 src/server.mjs            HTTP 服务（/v1/responses、/v1/chat/completions）
 src/codex-config.mjs      ~/.codex/config.toml 安全读写 + 精确还原 + 模型目录
-test/                     62 项单元与集成测试
+test/                     83 项单元与集成测试
 tools/                    往返验证、目录模板对照实验、DSH 会话导入
 ```
 

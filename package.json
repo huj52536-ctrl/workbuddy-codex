@@ -29,6 +29,7 @@
     "doctor": "node ./bin/workbuddy-codex.mjs doctor",
     "test": "node --test \"test/*.test.mjs\"",
     "test:roundtrip": "node tools/verify-roundtrip.mjs",
+    "test:install": "node tools/verify-install.mjs",
     "prove:catalog": "node tools/prove-catalog-fix.mjs"
   },
   "keywords": [

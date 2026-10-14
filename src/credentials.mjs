@@ -19,11 +19,24 @@ import { homedir, platform } from "node:os";
 import { join, dirname } from "node:path";
 import { spawn } from "node:child_process";
 
-export const BACKEND = "https://copilot.tencent.com";
-export const PLUGIN_BASE = `${BACKEND}/v2/plugin`;
-export const CONFIG_URL = `${BACKEND}/v3/config`;
-export const CHAT_URL = `${BACKEND}/v2/chat/completions`;
+import {
+  REGIONS, DEFAULT_REGION, endpointsFor, inferRegionFromDomain, resolveEndpoints,
+} from "./region.mjs";
+
+/**
+ * 默认端点（中国区），保留这些常量是为了**向后兼容**：
+ * 既有代码与测试都按 `copilot.tencent.com` 的形态引用它们。
+ *
+ * 需要其它区域时，走各 API 的 `endpoints` 选项（见 region.mjs），
+ * 而不是改这些常量 —— 保持默认行为恒定，避免"改区域把老用户弄坏"。
+ */
+export const BACKEND = endpointsFor(DEFAULT_REGION).backend;
+export const PLUGIN_BASE = endpointsFor(DEFAULT_REGION).pluginBase;
+export const CONFIG_URL = endpointsFor(DEFAULT_REGION).configUrl;
+export const CHAT_URL = endpointsFor(DEFAULT_REGION).chatUrl;
 export const USER_AGENT = "CLI/unknown CodeBuddy/2.137.1";
+
+export { REGIONS, DEFAULT_REGION, endpointsFor, inferRegionFromDomain, resolveEndpoints };
 
 export const API_KEY_ENVS = ["WORKBUDDY_API_KEY", "CODEBUDDY_API_KEY"];
 export const HOME_DIR = join(homedir(), ".workbuddy-codex");
@@ -185,13 +198,14 @@ const firstText = (...vals) => {
   return undefined;
 };
 
-export function normalizeSession(session) {
+export function normalizeSession(session, { defaultDomain } = {}) {
   const auth = withExpiry(session?.auth ?? session ?? {});
   const acc = session?.account ?? session?.user ?? {};
   const claims = tokenClaims(auth.accessToken);
   const userId = firstText(acc.userId, acc.uid, acc.user_id, acc.id, claims.userId, claims.uid, claims.sub);
   const enterpriseId = firstText(acc.enterpriseId, acc.tenantId, acc.enterprise_id, claims.enterpriseId, claims.tenantId);
-  const domain = firstText(auth.domain, acc.domain, "www.codebuddy.cn");
+  // 回退域名随区域：国际版账号若凭据里没写 domain，不能错填成 .cn
+  const domain = firstText(auth.domain, acc.domain, defaultDomain, endpointsFor(DEFAULT_REGION).defaultDomain);
   return {
     auth,
     account: { userId, enterpriseId, domain, displayName: firstText(acc.nickname, acc.displayName, acc.email) },
@@ -496,7 +510,8 @@ async function getJson(url, { headers, timeoutMs = 20_000 } = {}) {
 }
 
 /** 用 refreshToken 换新令牌。 */
-export async function refreshSession(session, { persist = true } = {}) {
+export async function refreshSession(session, { persist = true, endpoints } = {}) {
+  const ep = endpoints ?? endpointsFor(DEFAULT_REGION);
   const refreshToken = unwrapField(session?.auth?.refreshToken);
   if (!refreshToken) throw new Error("会话缺少 refreshToken，请重新登录");
 
@@ -508,7 +523,7 @@ export async function refreshSession(session, { persist = true } = {}) {
     "X-Auth-Refresh-Source": "plugin",
   };
 
-  const r = await postJson(`${PLUGIN_BASE}/auth/token/refresh`, { headers });
+  const r = await postJson(`${ep.pluginBase}/auth/token/refresh`, { headers });
   if (!r.ok || r.body?.code !== 0 || !r.body?.data) {
     throw new Error(`刷新令牌失败：HTTP ${r.status} ${r.body?.msg ?? r.body?.message ?? ""}`);
   }
@@ -541,10 +556,12 @@ function openBrowser(url) {
 
 /**
  * 交互式登录。返回并保存会话。
- * @param {{onUrl?:(url:string,opened:boolean)=>void, signal?:AbortSignal, timeoutMs?:number}} opts
+ * @param {{onUrl?:(url:string,opened:boolean)=>void, signal?:AbortSignal,
+ *          timeoutMs?:number, endpoints?:object}} opts
  */
-export async function loginWorkBuddy({ onUrl, signal, timeoutMs = 10 * 60_000 } = {}) {
-  const state = await postJson(`${PLUGIN_BASE}/auth/state?platform=CLI`, { headers: NO_ACCOUNT_HEADERS });
+export async function loginWorkBuddy({ onUrl, signal, timeoutMs = 10 * 60_000, endpoints } = {}) {
+  const ep = endpoints ?? endpointsFor(DEFAULT_REGION);
+  const state = await postJson(`${ep.pluginBase}/auth/state?platform=CLI`, { headers: NO_ACCOUNT_HEADERS });
   const st = state.body?.data;
   if (!st?.state || !st?.authUrl) {
     throw new Error(`创建登录会话失败：HTTP ${state.status} ${state.body?.msg ?? state.body?.message ?? ""}`);
@@ -557,7 +574,7 @@ export async function loginWorkBuddy({ onUrl, signal, timeoutMs = 10 * 60_000 } 
   while (Date.now() < deadline) {
     if (signal?.aborted) throw new Error("登录已取消");
     await new Promise((r) => setTimeout(r, 1500));
-    const r = await getJson(`${PLUGIN_BASE}/auth/token?state=${encodeURIComponent(st.state)}`, { headers: NO_ACCOUNT_HEADERS });
+    const r = await getJson(`${ep.pluginBase}/auth/token?state=${encodeURIComponent(st.state)}`, { headers: NO_ACCOUNT_HEADERS });
     if (r.ok && r.body?.code === 0 && r.body?.data) { auth = withExpiry(r.body.data); break; }
     if (r.status === 401 || r.status === 403) throw new Error(`登录被拒绝：HTTP ${r.status}`);
   }
@@ -573,7 +590,7 @@ export async function loginWorkBuddy({ onUrl, signal, timeoutMs = 10 * 60_000 } 
     "X-No-Department-Info": "true",
   };
   try {
-    const a = await getJson(`${PLUGIN_BASE}/login/account?state=${encodeURIComponent(st.state)}`, { headers: accHeaders });
+    const a = await getJson(`${ep.pluginBase}/login/account?state=${encodeURIComponent(st.state)}`, { headers: accHeaders });
     if (a.ok && a.body?.code === 0 && a.body?.data) account = a.body.data;
   } catch { /* 账号信息非必需 */ }
 
@@ -594,9 +611,10 @@ export async function loginWorkBuddy({ onUrl, signal, timeoutMs = 10 * 60_000 } 
  * 令牌能列出模型、但推理端点返回 401。因此本函数不能作为
  * "凭据可用"的证明 —— 必须另外用 verifyInference() 验证。
  */
-export async function fetchModels(credential, { timeoutMs = 20_000 } = {}) {
+export async function fetchModels(credential, { timeoutMs = 20_000, endpoints } = {}) {
+  const ep = endpoints ?? endpointsFor(DEFAULT_REGION);
   const headers = buildUpstreamHeaders(credential);
-  const res = await fetch(CONFIG_URL, { headers, signal: AbortSignal.timeout(timeoutMs) });
+  const res = await fetch(ep.configUrl, { headers, signal: AbortSignal.timeout(timeoutMs) });
   if (!res.ok) throw new Error(`模型目录 HTTP ${res.status}`);
   const body = await res.json();
   if (body?.code !== 0) throw new Error(`模型目录业务错误：${body?.msg ?? body?.code}`);
@@ -636,7 +654,8 @@ export async function fetchModels(credential, { timeoutMs = 20_000 } = {}) {
  *
  * @returns {{ok:boolean, status?:number, reason?:string, hint?:string}}
  */
-export async function verifyInference(credential, { model, timeoutMs = 60_000 } = {}) {
+export async function verifyInference(credential, { model, timeoutMs = 60_000, endpoints } = {}) {
+  const ep = endpoints ?? endpointsFor(DEFAULT_REGION);
   const headers = buildUpstreamHeaders(credential);
   headers.accept = "text/event-stream";
   const body = {
@@ -648,7 +667,7 @@ export async function verifyInference(credential, { model, timeoutMs = 60_000 } 
 
   let res;
   try {
-    res = await fetch(CHAT_URL, {
+    res = await fetch(ep.chatUrl, {
       method: "POST",
       headers,
       body: JSON.stringify(body),
@@ -658,7 +677,7 @@ export async function verifyInference(credential, { model, timeoutMs = 60_000 } 
     return { ok: false, reason: `网络错误：${e.message}`, hint: "检查网络或代理设置。" };
   }
 
-  if (res.status === 200) return { ok: true, status: 200 };
+  if (res.status === 200) return { ok: true, status: 200, endpoint: ep.backend };
 
   const text = await res.text().catch(() => "");
   const short = text.slice(0, 200).replace(/\s+/g, " ");
@@ -668,18 +687,33 @@ export async function verifyInference(credential, { model, timeoutMs = 60_000 } 
     return {
       ok: false,
       status: res.status,
+      endpoint: ep.backend,
       reason: `推理端点鉴权失败（HTTP ${res.status}）`,
       hint: isOpenresty
         ? "该令牌能列出模型，但推理时被拒。这通常意味着**令牌已实际失效**" +
           "（例如来自桌面端的旧会话文件），或账号在别处重新登录过导致旧令牌作废。" +
-          "解决办法：运行 `workbuddy-codex login` 重新登录，或设置 WORKBUDDY_API_KEY。"
+          "解决办法：运行 `workbuddy-codex login` 重新登录，或设置 WORKBUDDY_API_KEY。" +
+          "若这是国际版账号，请确认已用 --region intl。"
         : "令牌模式请确认**只**发送 Authorization（不要同时发 x-api-key）；" +
           "否则请重新登录或改用 API Key。",
       detail: short,
     };
   }
 
-  return { ok: false, status: res.status, reason: `推理端点返回 HTTP ${res.status}`, detail: short };
+  // 404 常见于「区域选错」：路径对但主机不对
+  if (res.status === 404) {
+    return {
+      ok: false,
+      status: 404,
+      endpoint: ep.backend,
+      reason: `推理端点不存在（HTTP 404 @ ${ep.backend}）`,
+      hint: "该主机上没有 /v2/chat/completions。若你的账号属于另一个区域，" +
+        "请用 `--region cn` 或 `--region intl` 指定。",
+      detail: short,
+    };
+  }
+
+  return { ok: false, status: res.status, endpoint: ep.backend, reason: `推理端点返回 HTTP ${res.status}`, detail: short };
 }
 
 export { REQUEST_HEADERS, NO_ACCOUNT_HEADERS, postJson, getJson };
