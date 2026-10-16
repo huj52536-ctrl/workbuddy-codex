@@ -14,4 +14,12 @@ node_modules/
 Thumbs.db
 .idea/
 .vscode/
+
+# 一次性临时文件
 .commit-msg.txt
+.region-commit.txt
+
+# 维护者专用的网络辅助脚本（git 传输不可用时用 GitHub API 推送）。
+# 与产品功能无关，故不随仓库发布；本机仍保留。
+tools/push-via-api.mjs
+tools/update-file-via-api.mjs

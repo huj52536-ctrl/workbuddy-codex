@@ -6,8 +6,9 @@ Codex 0.95.0 起移除了 `wire_api = "chat"`，只认 **Responses API**；而 W
 后端只提供 **Chat Completions**。本工具在本地做 **Responses ⇄ Chat Completions
 双向协议转换**，因此你**不需要**降级 Codex，也**不需要**手改 `wire_api`。
 
-> 已验证环境：Codex CLI `0.162.0-alpha.2`（Windows）+ WorkBuddy 中国版。
-> 文本对话、工具调用、多轮 agent 回路均已实测跑通。
+> **已验证环境**：Codex CLI `0.162.0-alpha.2` 与 `0.163.0-alpha.10.2`（Windows）
+> + WorkBuddy 中国版。文本对话、工具调用、多轮 agent 回路均已实测跑通。
+> 跨大版本升级后仍兼容（0.162 → 0.163 实测通过）。
 
 ---
 
@@ -314,7 +315,8 @@ workbuddy-codex models --region intl
 3. **`namespace` 工具被拍平**为 `namespace__tool` 形式。
 4. 桥接进程需**保持运行**（`install` 已配置后台运行 + 开机自启）。
 5. 上游是非公开承诺的接口，路径与 Header 可能随客户端更新而变化。
-6. **中国区**已在 Windows + Codex 0.162 上完整实测（含工具调用与多轮 agent 回路）。
+6. **中国区**已在 Windows + Codex **0.162 与 0.163** 上完整实测（含工具调用与多轮
+   agent 回路），跨大版本升级后仍兼容。
    **国际版**仅验证到端点可达与目录接口兼容，**未经账号级端到端验证**。
    macOS / Linux 的代码路径已按跨平台方式编写（`spawn detached`、`ps`/`lsof`），
    但同样**未经实机验证**。
